@@ -2,7 +2,7 @@
 
 Experimental tooling for forecasting training-regime changes from cheap, training-time internal signals.
 
-The first experiment studies **grokking in modular addition**. The goal is not merely to reproduce grokking, but to ask whether metrics available *before* held-out accuracy moves can predict whether/when a run will later generalize.
+The first experiment studies **grokking in modular addition**. The default setup follows the well-studied reference regime: addition mod 113, 30% train split, a one-layer 4-head Transformer with d_model=128 and d_mlp=512, ReLU, no LayerNorm or biases, full-batch AdamW, lr=1e-3, weight decay 1.0, betas=(0.9, 0.98), and 40,000 optimization steps. The goal is not merely to reproduce grokking, but to ask whether metrics available *before* held-out accuracy moves can predict whether/when a run will later generalize.
 
 ## Research discipline
 
@@ -13,7 +13,7 @@ Metrics are separated into two groups:
 
 The first version logs ordinary baselines plus representation and optimization-trajectory diagnostics:
 
-- train loss/accuracy and generalization gap
+- train loss/accuracy; held-out generalization gap is logged only as a retrospective `label_*`
 - learning rate and throughput
 - parameter norms and matrix spectral statistics
 - gradient norm/RMS/variance and gradient-direction cosine
@@ -30,12 +30,21 @@ Raw spectral values are also written to JSONL so later analysis is not limited t
 
 ## Kaggle quick start
 
-In a Kaggle notebook with GPU enabled:
+In a Kaggle notebook with GPU enabled, this repository is currently **private**. Add a Kaggle Secret named `GITHUB_TOKEN` containing a GitHub token that can read this repository, then run:
 
 ```python
-!git clone https://github.com/Vedsaga/tulya-training-dynamics.git
+from kaggle_secrets import UserSecretsClient
+import subprocess
+
+token = UserSecretsClient().get_secret("GITHUB_TOKEN")
+subprocess.run(
+    ["git", "clone", f"https://x-access-token:{token}@github.com/Vedsaga/tulya-training-dynamics.git"],
+    check=True,
+)
 %cd tulya-training-dynamics
 ```
+
+If you later make the repository public, a normal `git clone` is sufficient.
 
 Then:
 
@@ -45,7 +54,7 @@ from kaggle_grokking_experiment import ExperimentConfig, run_experiment
 cfg = ExperimentConfig(
     output_dir="/kaggle/working/tulya_runs/seed_0",
     seed=0,
-    max_steps=30_000,
+    max_steps=40_000,
     eval_every=100,
 )
 
@@ -70,7 +79,7 @@ config.json
 metrics.csv
 spectra.jsonl
 summary.json
-checkpoints/        # only when checkpoint_every > 0
+checkpoints/        # step 0, every 1000 steps by default, and final state
 ```
 
 ## First falsifiable hypothesis
