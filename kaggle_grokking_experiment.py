@@ -303,6 +303,84 @@ def spectral_stats(
     return stats, kept
 
 
+@torch.no_grad()
+def frequency_concentration_stats(
+    matrix: torch.Tensor, keep: int
+) -> Tuple[Dict[str, float], List[float]]:
+    """Fourier-energy concentration along the modular-number axis.
+
+    The DC component is excluded so the metric tracks learned periodic structure
+    rather than a global mean offset.
+    """
+    x = matrix.detach().float()
+    spectrum = torch.fft.rfft(x, dim=0)
+    energy = spectrum.abs().square().sum(dim=1)
+    if energy.numel() > 1:
+        energy = energy[1:]
+    total = energy.sum()
+    n_freq = max(1, energy.numel())
+    if total.item() <= 0.0:
+        probs = torch.zeros_like(energy)
+        if probs.numel():
+            probs[0] = 1.0
+    else:
+        probs = energy / total
+    nz = probs > 0
+    entropy = -(probs[nz] * torch.log(probs[nz])).sum() if probs.numel() else torch.tensor(0.0)
+    effective = torch.exp(entropy)
+    cumulative = torch.cumsum(probs, dim=0)
+    rank90 = (
+        int(torch.searchsorted(cumulative, torch.tensor(0.90, device=cumulative.device)).item()) + 1
+        if probs.numel()
+        else 0
+    )
+    entropy_max = math.log(n_freq) if n_freq > 1 else 1.0
+    stats = {
+        "effective_frequencies": float(effective.item()),
+        "effective_frequencies_norm": float(effective.item() / n_freq),
+        "entropy_norm": float(entropy.item() / entropy_max) if n_freq > 1 else 0.0,
+        "top1_energy": float(probs[:1].sum().item()) if probs.numel() else float("nan"),
+        "top5_energy": float(probs[: min(5, probs.numel())].sum().item()) if probs.numel() else float("nan"),
+        "rank90_norm": float(rank90 / n_freq) if n_freq else float("nan"),
+    }
+    kept = [float(v) for v in probs[:keep].detach().cpu().tolist()]
+    return stats, kept
+
+
+@torch.no_grad()
+def fourier_diagnostics(
+    model: ModularTransformer, modulus: int, keep: int
+) -> Tuple[Dict[str, float], Dict[str, Any]]:
+    emb_stats, emb_energy = frequency_concentration_stats(
+        model.token_embedding.weight[:modulus], keep
+    )
+    unemb_stats, unemb_energy = frequency_concentration_stats(
+        model.unembed.weight[:modulus], keep
+    )
+    scalar: Dict[str, float] = {}
+    for prefix, stats in (("fourier_embedding", emb_stats), ("fourier_unembed", unemb_stats)):
+        for key, value in stats.items():
+            scalar[f"{prefix}_{key}"] = value
+    return scalar, {
+        "fourier_embedding_energy": emb_energy,
+        "fourier_unembed_energy": unemb_energy,
+    }
+
+
+@torch.no_grad()
+def layerwise_parameter_stats(model: nn.Module) -> Dict[str, Dict[str, float]]:
+    out: Dict[str, Dict[str, float]] = {}
+    for name, parameter in model.named_parameters():
+        w = parameter.detach().float()
+        grad = parameter.grad.detach().float() if parameter.grad is not None else None
+        out[name] = {
+            "weight_l2": float(torch.linalg.vector_norm(w).item()),
+            "weight_rms": float(torch.sqrt(torch.mean(w.square())).item()),
+            "grad_l2": float(torch.linalg.vector_norm(grad).item()) if grad is not None else float("nan"),
+        }
+    return out
+
+
 class CountSketchProjector:
     """Cheap fixed random projection for parameter-update trajectories."""
 
@@ -591,6 +669,12 @@ def run_experiment(cfg: ExperimentConfig) -> Dict[str, Any]:
         "feature_repr_final_participation_ratio", "feature_repr_final_participation_ratio_norm",
         "feature_repr_final_top1_energy", "feature_repr_final_top5_energy", "feature_repr_final_rank90_norm",
         "feature_attention_entropy_norm", "feature_attention_peak", "feature_attention_head_diversity",
+        "feature_fourier_embedding_effective_frequencies", "feature_fourier_embedding_effective_frequencies_norm",
+        "feature_fourier_embedding_entropy_norm", "feature_fourier_embedding_top1_energy",
+        "feature_fourier_embedding_top5_energy", "feature_fourier_embedding_rank90_norm",
+        "feature_fourier_unembed_effective_frequencies", "feature_fourier_unembed_effective_frequencies_norm",
+        "feature_fourier_unembed_entropy_norm", "feature_fourier_unembed_top1_energy",
+        "feature_fourier_unembed_top5_energy", "feature_fourier_unembed_rank90_norm",
         "feature_weight_matrix_effective_rank_norm_mean", "feature_weight_matrix_top1_energy_mean",
         "feature_weight_matrix_rank90_norm_mean",
         "feature_cuda_allocated_mb", "feature_cuda_reserved_mb", "feature_cuda_max_allocated_mb",
@@ -727,6 +811,11 @@ def run_experiment(cfg: ExperimentConfig) -> Dict[str, Any]:
             repr_scalar, repr_raw = representation_diagnostics(
                 model, probe_x, keep=cfg.keep_spectrum_values
             )
+            fourier_scalar, fourier_raw = fourier_diagnostics(
+                model, cfg.modulus, keep=cfg.keep_spectrum_values
+            )
+            repr_scalar.update(fourier_scalar)
+            repr_raw.update(fourier_raw)
             weight_spectral, weight_raw = weight_matrix_spectral_summary(
                 model, keep=cfg.keep_spectrum_values
             )
@@ -801,6 +890,7 @@ def run_experiment(cfg: ExperimentConfig) -> Dict[str, Any]:
             {
                 "meta_step": step,
                 "feature_update_energy": update_spectrum,
+                "layerwise_parameter_stats": layerwise_parameter_stats(model),
                 **raw_spectra,
             },
         )
