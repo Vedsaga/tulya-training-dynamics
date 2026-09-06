@@ -22,6 +22,8 @@ The first version logs ordinary baselines plus representation and optimization-t
 - input/final-representation effective rank, spectral entropy, participation ratio, top singular-value energy
 - prediction entropy, confidence, and classification margin
 - attention entropy, peak attention, and head diversity
+- Fourier concentration of embedding/unembedding weights as a task-specific mechanistic baseline
+- per-parameter weight/gradient norms in the JSONL diagnostics stream
 - CUDA memory use when available
 - retrospective test loss/accuracy
 - memorization and grokking event times in the run summary
@@ -30,21 +32,27 @@ Raw spectral values are also written to JSONL so later analysis is not limited t
 
 ## Kaggle quick start
 
-In a Kaggle notebook with GPU enabled, this repository is currently **private**. Add a Kaggle Secret named `GITHUB_TOKEN` containing a GitHub token that can read this repository, then run:
+In a Kaggle notebook with GPU enabled, this repository is currently **private**. The safest quick path is to download only the experiment module rather than embedding a token in a Git remote URL. Add a Kaggle Secret named `GITHUB_TOKEN` containing a GitHub token that can read this repository, then run:
 
 ```python
 from kaggle_secrets import UserSecretsClient
-import subprocess
+import requests
 
 token = UserSecretsClient().get_secret("GITHUB_TOKEN")
-subprocess.run(
-    ["git", "clone", f"https://x-access-token:{token}@github.com/Vedsaga/tulya-training-dynamics.git"],
-    check=True,
+url = "https://api.github.com/repos/Vedsaga/tulya-training-dynamics/contents/kaggle_grokking_experiment.py?ref=main"
+response = requests.get(
+    url,
+    headers={
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.raw+json",
+    },
+    timeout=30,
 )
-%cd tulya-training-dynamics
+response.raise_for_status()
+open("/kaggle/working/kaggle_grokking_experiment.py", "wb").write(response.content)
 ```
 
-If you later make the repository public, a normal `git clone` is sufficient.
+If you later make the repository public, you can clone it normally or download the raw file without a token.
 
 Then:
 
