@@ -104,8 +104,7 @@ def make_modular_dataset(
     split = int(len(pairs) * train_fraction)
     train_ids, test_ids = order[:split], order[split:]
 
-    op_token = modulus
-    eq_token = modulus + 1
+    eq_token = modulus
 
     def build(ids: np.ndarray) -> Tuple[torch.Tensor, torch.Tensor]:
         xs: List[List[int]] = []
@@ -118,7 +117,7 @@ def make_modular_dataset(
                 y = (a - b) % modulus
             else:
                 raise ValueError(f"unsupported operation: {operation}")
-            xs.append([a, op_token, b, eq_token])
+            xs.append([a, b, eq_token])
             ys.append(y)
         return torch.tensor(xs, dtype=torch.long), torch.tensor(ys, dtype=torch.long)
 
@@ -130,34 +129,38 @@ def make_modular_dataset(
 class DiagnosticBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, d_mlp: int, dropout: float) -> None:
         super().__init__()
-        self.ln1 = nn.LayerNorm(d_model)
         self.attn = nn.MultiheadAttention(
             d_model,
             n_heads,
             dropout=dropout,
+            bias=False,
             batch_first=True,
         )
-        self.ln2 = nn.LayerNorm(d_model)
         self.mlp = nn.Sequential(
-            nn.Linear(d_model, d_mlp),
-            nn.GELU(),
-            nn.Linear(d_mlp, d_model),
+            nn.Linear(d_model, d_mlp, bias=False),
+            nn.ReLU(),
+            nn.Linear(d_mlp, d_model, bias=False),
         )
         self.dropout = nn.Dropout(dropout)
 
     def forward(
         self, x: torch.Tensor, need_attention: bool = False
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        z = self.ln1(x)
+        seq_len = x.shape[1]
+        causal_mask = torch.triu(
+            torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device),
+            diagonal=1,
+        )
         attn_out, attn_weights = self.attn(
-            z,
-            z,
-            z,
+            x,
+            x,
+            x,
+            attn_mask=causal_mask,
             need_weights=need_attention,
             average_attn_weights=False,
         )
         x = x + self.dropout(attn_out)
-        x = x + self.dropout(self.mlp(self.ln2(x)))
+        x = x + self.dropout(self.mlp(x))
         return x, attn_weights if need_attention else None
 
 
@@ -165,8 +168,8 @@ class ModularTransformer(nn.Module):
     def __init__(self, cfg: ExperimentConfig) -> None:
         super().__init__()
         self.modulus = cfg.modulus
-        self.seq_len = 4
-        self.token_embedding = nn.Embedding(cfg.modulus + 2, cfg.d_model)
+        self.seq_len = 3
+        self.token_embedding = nn.Embedding(cfg.modulus + 1, cfg.d_model)
         self.position_embedding = nn.Parameter(torch.zeros(1, self.seq_len, cfg.d_model))
         self.blocks = nn.ModuleList(
             [
@@ -174,7 +177,6 @@ class ModularTransformer(nn.Module):
                 for _ in range(cfg.n_layers)
             ]
         )
-        self.final_ln = nn.LayerNorm(cfg.d_model)
         self.unembed = nn.Linear(cfg.d_model, cfg.modulus, bias=False)
         nn.init.normal_(self.position_embedding, std=0.02)
 
@@ -192,7 +194,6 @@ class ModularTransformer(nn.Module):
                 diag["block_outputs"].append(x.detach())
                 diag["attention"].append(attn.detach() if attn is not None else None)
 
-        x = self.final_ln(x)
         final_repr = x[:, -1, :]
         logits = self.unembed(final_repr)
         if diagnostics and diag is not None:
