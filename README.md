@@ -30,6 +30,14 @@ The first version logs ordinary baselines plus representation and optimization-t
 
 Raw spectral values are also written to JSONL so later analysis is not limited to the scalar summaries chosen today.
 
+## Easiest Kaggle path
+
+If you use Kaggle's **Import notebook → GitHub** flow, select:
+
+`kaggle_grokking.ipynb`
+
+That notebook is self-contained: it includes the experiment implementation, a 2,000-step sanity run, diagnostic plots, automatic sanity checks, and an opt-in 40,000-step full run.
+
 ## Kaggle quick start
 
 In a Kaggle notebook with GPU enabled, this repository is currently **private**. The safest quick path is to download only the experiment module rather than embedding a token in a Git remote URL. Add a Kaggle Secret named `GITHUB_TOKEN` containing a GitHub token that can read this repository, then run:
