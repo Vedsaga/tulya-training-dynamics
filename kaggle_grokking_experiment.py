@@ -30,7 +30,7 @@ class ExperimentConfig:
     seed: int = 0
     modulus: int = 113
     operation: str = "add"  # add | subtract
-    train_fraction: float = 0.40
+    train_fraction: float = 0.30
 
     d_model: int = 128
     n_heads: int = 4
@@ -41,8 +41,11 @@ class ExperimentConfig:
     optimizer: str = "adamw"
     lr: float = 1e-3
     weight_decay: float = 1.0
-    batch_size: int = 512
-    max_steps: int = 30_000
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.98
+    warmup_steps: int = 10
+    batch_size: int = 0  # 0 = full batch (canonical grokking setup)
+    max_steps: int = 40_000
 
     eval_every: int = 100
     diagnostics_every: int = 200
@@ -57,7 +60,7 @@ class ExperimentConfig:
     memorization_train_threshold: float = 0.99
     memorization_test_ceiling: float = 0.50
 
-    checkpoint_every: int = 0
+    checkpoint_every: int = 1000
     keep_spectrum_values: int = 16
     device: str = "auto"
     deterministic: bool = False
@@ -472,9 +475,19 @@ def append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
 def build_optimizer(model: nn.Module, cfg: ExperimentConfig) -> torch.optim.Optimizer:
     name = cfg.optimizer.lower()
     if name == "adamw":
-        return torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+        return torch.optim.AdamW(
+            model.parameters(),
+            lr=cfg.lr,
+            weight_decay=cfg.weight_decay,
+            betas=(cfg.adam_beta1, cfg.adam_beta2),
+        )
     if name == "adam":
-        return torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+        return torch.optim.Adam(
+            model.parameters(),
+            lr=cfg.lr,
+            weight_decay=cfg.weight_decay,
+            betas=(cfg.adam_beta1, cfg.adam_beta2),
+        )
     if name == "sgd":
         return torch.optim.SGD(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     raise ValueError(f"unsupported optimizer: {cfg.optimizer}")
@@ -595,11 +608,26 @@ def run_experiment(cfg: ExperimentConfig) -> Dict[str, Any]:
     if spectra_path.exists():
         spectra_path.unlink()
 
+    if cfg.checkpoint_every > 0:
+        torch.save(
+            {"step": 0, "model": model.state_dict(), "optimizer": optimizer.state_dict(), "config": asdict(cfg)},
+            output_dir / "checkpoints" / "step_0000000.pt",
+        )
+
     for step in range(1, cfg.max_steps + 1):
         model.train()
-        batch_ids = torch.randint(0, train_x.shape[0], (cfg.batch_size,), device=device)
-        xb = train_x[batch_ids]
-        yb = train_y[batch_ids]
+
+        warmup_scale = 1.0 if cfg.warmup_steps <= 0 else min(step / cfg.warmup_steps, 1.0)
+        for group in optimizer.param_groups:
+            group["lr"] = cfg.lr * warmup_scale
+
+        if cfg.batch_size <= 0 or cfg.batch_size >= train_x.shape[0]:
+            xb = train_x
+            yb = train_y
+        else:
+            batch_ids = torch.randint(0, train_x.shape[0], (cfg.batch_size,), device=device)
+            xb = train_x[batch_ids]
+            yb = train_y[batch_ids]
 
         should_probe_update = step % cfg.update_probe_every == 0
         before_params = flatten_parameters(model).clone() if should_probe_update else None
@@ -798,6 +826,17 @@ def run_experiment(cfg: ExperimentConfig) -> Dict[str, Any]:
             print("Non-finite training loss detected; stopping run.")
             break
 
+    if cfg.checkpoint_every > 0:
+        torch.save(
+            {
+                "step": int(history[-1]["meta_step"]) if history else 0,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "config": asdict(cfg),
+            },
+            output_dir / "checkpoints" / "final.pt",
+        )
+
     memorization_step = detect_event_step(
         history,
         lambda r: r["feature_train_acc"] >= cfg.memorization_train_threshold
@@ -842,18 +881,21 @@ def parse_args() -> ExperimentConfig:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--modulus", type=int, default=113)
     parser.add_argument("--operation", choices=["add", "subtract"], default="add")
-    parser.add_argument("--train-fraction", type=float, default=0.40)
-    parser.add_argument("--max-steps", type=int, default=30_000)
+    parser.add_argument("--train-fraction", type=float, default=0.30)
+    parser.add_argument("--max-steps", type=int, default=40_000)
     parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument("--diagnostics-every", type=int, default=200)
-    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--batch-size", type=int, default=0, help="0 means full-batch training")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1.0)
+    parser.add_argument("--adam-beta1", type=float, default=0.9)
+    parser.add_argument("--adam-beta2", type=float, default=0.98)
+    parser.add_argument("--warmup-steps", type=int, default=10)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--d-mlp", type=int, default=512)
     parser.add_argument("--n-layers", type=int, default=1)
-    parser.add_argument("--checkpoint-every", type=int, default=0)
+    parser.add_argument("--checkpoint-every", type=int, default=1000)
     parser.add_argument("--device", default="auto")
     args = parser.parse_args()
     return ExperimentConfig(
@@ -868,6 +910,9 @@ def parse_args() -> ExperimentConfig:
         batch_size=args.batch_size,
         lr=args.lr,
         weight_decay=args.weight_decay,
+        adam_beta1=args.adam_beta1,
+        adam_beta2=args.adam_beta2,
+        warmup_steps=args.warmup_steps,
         d_model=args.d_model,
         n_heads=args.n_heads,
         d_mlp=args.d_mlp,
