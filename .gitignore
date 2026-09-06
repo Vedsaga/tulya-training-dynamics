@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+results/
+tulya_runs/
+checkpoints/
+*.pt
+*.pth
+.DS_Store
