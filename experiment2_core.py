@@ -76,8 +76,17 @@ def image_setup(sp,root):
         tr=transforms.Compose([transforms.ToTensor(),transforms.Normalize((.4914,.4822,.4465),(.247,.2435,.2616))])
         a=datasets.CIFAR10(root,train=True,download=True,transform=tr); v=datasets.CIFAR10(root,train=False,download=True,transform=tr)
         m=CNN(); steps,lr,wd,n=2200,1e-3,1e-4,12000
-    if sp.intent=="high_lr": lr=.08 if sp.domain=="fashion_mnist_mlp" else .03
-    if sp.intent=="low_lr": lr=2e-6
+
+    # Single preregistered run-generation repair after seed-0 preflight.
+    if sp.domain=="fashion_mnist_mlp":
+        if sp.intent=="high_lr": lr=.50
+        if sp.intent=="low_lr": lr=1e-7
+    else:
+        if sp.intent=="healthy":
+            n=30000; steps=3500
+        if sp.intent=="high_lr": lr=.20
+        if sp.intent=="low_lr": lr=2e-6
+
     if sp.intent=="small_train": n=500; steps=2600
     if sp.intent=="strong_regularization": wd=2.; lr=3e-4
     a=subset(a,n,sp.seed+11); v=subset(v,4000,sp.seed+19)
