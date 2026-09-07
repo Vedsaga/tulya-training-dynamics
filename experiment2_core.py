@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, json, math, os, random, subprocess, sys, time
+import argparse, json, math, os, queue, random, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -276,36 +276,46 @@ def prepare_datasets(dataroot="/kaggle/working/tulya_data"):
     datasets.CIFAR10(root,train=False,download=True)
 
 
-def _subprocess_worker(gpu_id, work, outroot, dataroot):
-    completed=[]
+def _run_spec_subprocess(gpu_id, sp, outroot, dataroot):
     env=os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"]=str(gpu_id)
     env["PYTHONUNBUFFERED"]="1"
-    script=str(Path(__file__).resolve())
-    for sp in work:
-        p=Path(outroot)/sp.run_id/"summary.json"
-        if p.exists():
-            sm=json.loads(p.read_text())
-            print(f"[GPU {gpu_id}] reuse {sp.run_id}: {sm['event']}",flush=True)
-            completed.append(sm)
-            continue
-        print(f"[GPU {gpu_id}] start {sp.run_id}",flush=True)
-        cmd=[sys.executable,script,"--worker",
-             "--domain",sp.domain,"--intent",sp.intent,"--seed",str(sp.seed),
-             "--outroot",str(outroot),"--dataroot",str(dataroot)]
-        cp=subprocess.run(cmd,env=env,text=True,capture_output=True)
-        if cp.returncode!=0:
-            raise RuntimeError(
-                f"worker failed on GPU {gpu_id}: {sp.run_id}\nSTDOUT:\n{cp.stdout}\nSTDERR:\n{cp.stderr}"
-            )
+    p=Path(outroot)/sp.run_id/"summary.json"
+    if p.exists():
         sm=json.loads(p.read_text())
-        print(
-            f"[GPU {gpu_id}] done {sp.run_id}: {sm['event']} "
-            f"observed={sm['event_observed']} @ {sm['event_time_fraction']:.3f}, "
-            f"{sm['wall_time_sec']:.1f}s",
-            flush=True,
+        print(f"[GPU {gpu_id}] reuse {sp.run_id}: {sm['event']}",flush=True)
+        return sm
+    print(f"[GPU {gpu_id}] start {sp.run_id}",flush=True)
+    script=str(Path(__file__).resolve())
+    cmd=[sys.executable,script,"--worker",
+         "--domain",sp.domain,"--intent",sp.intent,"--seed",str(sp.seed),
+         "--outroot",str(outroot),"--dataroot",str(dataroot)]
+    cp=subprocess.run(cmd,env=env,text=True,capture_output=True)
+    if cp.returncode!=0:
+        raise RuntimeError(
+            f"worker failed on GPU {gpu_id}: {sp.run_id}\nSTDOUT:\n{cp.stdout}\nSTDERR:\n{cp.stderr}"
         )
-        completed.append(sm)
+    sm=json.loads(p.read_text())
+    print(
+        f"[GPU {gpu_id}] done {sp.run_id}: {sm['event']} "
+        f"observed={sm['event_observed']} @ {sm['event_time_fraction']:.3f}, "
+        f"{sm['wall_time_sec']:.1f}s",
+        flush=True,
+    )
+    return sm
+
+
+def _dynamic_gpu_worker(gpu_id, work_queue, outroot, dataroot):
+    completed=[]
+    while True:
+        try:
+            sp=work_queue.get_nowait()
+        except queue.Empty:
+            break
+        try:
+            completed.append(_run_spec_subprocess(gpu_id,sp,outroot,dataroot))
+        finally:
+            work_queue.task_done()
     return completed
 
 
@@ -334,15 +344,16 @@ def run_suite_parallel(outroot,seeds=(0,1,2,3),domains:Optional[Sequence[str]]=N
     if any(x.domain in {"fashion_mnist_mlp","cifar10_cnn"} for x in ss):
         prepare_datasets(dataroot)
 
-    # Round-robin gives both GPUs a comparable mix of domains/configurations.
-    queues=[[] for _ in ids]
-    for i,sp in enumerate(ss):
-        queues[i % len(ids)].append(sp)
+    # Dynamic queue: as soon as a GPU finishes a short run it immediately
+    # takes the next pending run instead of waiting for a statically assigned
+    # long-job queue on the other GPU.
+    work_queue=queue.Queue()
+    for sp in ss:
+        work_queue.put(sp)
 
-    print(f"Launching {len(ss)} runs across {len(ids)} GPU workers: {ids}",flush=True)
+    print(f"Launching {len(ss)} runs across {len(ids)} dynamically balanced GPU workers: {ids}",flush=True)
     with ThreadPoolExecutor(max_workers=len(ids)) as ex:
-        futs=[ex.submit(_subprocess_worker,g,work,outroot,dataroot)
-              for g,work in zip(ids,queues) if work]
+        futs=[ex.submit(_dynamic_gpu_worker,g,work_queue,outroot,dataroot) for g in ids]
         for fut in as_completed(futs):
             fut.result()
 
