@@ -3,7 +3,7 @@ from __future__ import annotations
 import json, math
 from pathlib import Path
 import numpy as np, pandas as pd
-from experiment2_core import DOMAINS,HARMFUL
+from experiment2_core import DOMAINS,HARMFUL,NO_EVENT
 
 OBS=(.10,.20,.30,.40)
 A=["meta_step_fraction","feature_train_loss","feature_train_acc","feature_lr"]
@@ -29,15 +29,29 @@ def prefix(df,features,obs):
         out[c+"__slope"]=float(np.polyfit(np.linspace(0,1,len(s)),s.to_numpy(),1)[0]) if len(s)>1 else 0.
     return out
 
+def _as_bool(x):
+    if isinstance(x,(bool,np.bool_)): return bool(x)
+    return str(x).strip().lower() in {"1","true","yes"}
+
 def build_table(root):
     root=Path(root);man=pd.read_csv(root/"manifest.csv");rows=[];allf=sorted(set(A+B+C))
     for _,m in man.iterrows():
         d=pd.read_csv(root/m.run_id/"metrics.csv")
+        observed=_as_bool(m.event_observed)
+        stop=float(m.event_time_fraction)
         for o in OBS:
-            if float(m.event_time_fraction)<=o:continue
-            r=dict(meta_run_id=m.run_id,meta_domain=m.domain,meta_observation_fraction=o,label_event=m.event,
-                   label_event_time_fraction=float(m.event_time_fraction),label_time_remaining_fraction=float(m.event_time_fraction)-o,
-                   label_harmful=int(m.event in HARMFUL))
+            # Observed events leave the risk set once they occur. Right-censored
+            # runs remain valid forecast examples until their censor time.
+            if stop<=o: continue
+            label=str(m.event) if observed else NO_EVENT
+            r=dict(
+                meta_run_id=m.run_id,meta_domain=m.domain,meta_observation_fraction=o,
+                label_event=label,label_event_observed=int(observed),
+                label_event_time_fraction=(stop if observed else np.nan),
+                label_censor_time_fraction=(np.nan if observed else stop),
+                label_time_remaining_fraction=((stop-o) if observed else np.nan),
+                label_harmful=int(observed and str(m.event) in HARMFUL),
+            )
             r.update(prefix(d,allf,o));rows.append(r)
     t=pd.DataFrame(rows);t.to_csv(root/"forecast_table.csv",index=False);return t
 
@@ -62,12 +76,38 @@ def ece(y,p,classes,bins=10):
         if m.any():ans+=m.mean()*abs(ok[m].mean()-conf[m].mean())
     return float(ans)
 
+
+def macro_auc(y,p,classes):
+    from sklearn.preprocessing import label_binarize
+    present=[c for c in classes if c in set(y)]
+    if len(present)<2:return float("nan")
+    ii=[list(classes).index(c) for c in present]
+    pp=p[:,ii];pp=pp/pp.sum(1,keepdims=True).clip(min=1e-12)
+    try:
+        if len(present)==2:
+            return float(roc_auc_score((y==present[1]).astype(int),pp[:,1]))
+        return float(roc_auc_score(label_binarize(y,classes=present),pp,average="macro",multi_class="ovr"))
+    except ValueError:
+        return float("nan")
+
+def bootstrap_auc_ci(y,p,classes,run_ids,n_boot=500,seed=12345):
+    rng=np.random.default_rng(seed);u=np.array(sorted(set(run_ids)));vals=[]
+    if len(u)<2:return float("nan"),float("nan")
+    by={rid:np.flatnonzero(run_ids==rid) for rid in u}
+    for _ in range(n_boot):
+        draw=rng.choice(u,size=len(u),replace=True)
+        idx=np.concatenate([by[r] for r in draw])
+        v=macro_auc(y[idx],p[idx],classes)
+        if math.isfinite(v):vals.append(v)
+    if len(vals)<20:return float("nan"),float("nan")
+    return float(np.quantile(vals,.025)),float(np.quantile(vals,.975))
+
 def evaluate(root):
     from sklearn.impute import SimpleImputer
     from sklearn.linear_model import LogisticRegression,Ridge
     from sklearn.metrics import roc_auc_score
     from sklearn.pipeline import Pipeline
-    from sklearn.preprocessing import StandardScaler,label_binarize
+    from sklearn.preprocessing import StandardScaler
 
     root=Path(root);t=pd.read_csv(root/"forecast_table.csv") if (root/"forecast_table.csv").exists() else build_table(root)
     systems={"A_learning_curve":A,"B_raw_telemetry":B,"C_canonical":C};rows=[]
@@ -78,14 +118,20 @@ def evaluate(root):
             clf=Pipeline([("imp",SimpleImputer(strategy="median")),("sc",StandardScaler()),
                           ("m",LogisticRegression(max_iter=3000,class_weight="balanced"))])
             clf.fit(Xtr,ytr);p=clf.predict_proba(Xte);classes=clf.named_steps["m"].classes_;pred=classes[p.argmax(1)]
-            shared=[c for c in classes if c in set(yte)];auc=float("nan")
-            if len(shared)>=2:
-                ii=[list(classes).index(c) for c in shared];pp=p[:,ii];pp/=pp.sum(1,keepdims=True).clip(min=1e-12)
-                if len(shared)==2:auc=float(roc_auc_score((yte==shared[1]).astype(int),pp[:,1]))
-                else:auc=float(roc_auc_score(label_binarize(yte,classes=shared),pp,average="macro",multi_class="ovr"))
+            auc=macro_auc(yte,p,classes)
+            ci_lo,ci_hi=bootstrap_auc_ci(
+                yte,p,classes,te.meta_run_id.to_numpy(),
+                n_boot=500,seed=20260907+list(DOMAINS).index(held)
+            )
             reg=Pipeline([("imp",SimpleImputer(strategy="median")),("sc",StandardScaler()),("m",Ridge(alpha=1.0))])
-            reg.fit(Xtr,tr.label_time_remaining_fraction);tp=np.clip(reg.predict(Xte),0,1);correct=pred==yte
-            tmae=float(np.mean(np.abs(tp[correct]-te.label_time_remaining_fraction.to_numpy()[correct]))) if correct.any() else float("nan")
+            tr_time=tr[tr.label_event_observed==1]
+            if len(tr_time)>=2:
+                reg.fit(tr_time[fs],tr_time.label_time_remaining_fraction)
+                tp=np.clip(reg.predict(Xte),0,1)
+                correct=(pred==yte)&(te.label_event_observed.to_numpy()==1)
+                tmae=float(np.mean(np.abs(tp[correct]-te.label_time_remaining_fraction.to_numpy()[correct]))) if correct.any() else float("nan")
+            else:
+                tmae=float("nan")
 
             harmidx=[i for i,c in enumerate(classes) if c in HARMFUL]
             ptr=clf.predict_proba(Xtr)[:,harmidx].sum(1) if harmidx else np.zeros(len(tr));pte=p[:,harmidx].sum(1) if harmidx else np.zeros(len(te))
@@ -98,7 +144,8 @@ def evaluate(root):
                     x=hit.iloc[0];alerts.append((rid,int(x.label_harmful),float(x.label_event_time_fraction-x.meta_observation_fraction)))
             nonharm=int(te.groupby("meta_run_id").label_harmful.first().eq(0).sum())
             fp=sum(1 for _,h,_ in alerts if h==0);leads=[lead for _,h,lead in alerts if h==1 and lead>0]
-            rows.append(dict(held_out_domain=held,system=system,macro_auroc=auc,brier=brier(yte,p,classes),ece=ece(yte,p,classes),
+            rows.append(dict(held_out_domain=held,system=system,macro_auroc=auc,macro_auroc_ci_low=ci_lo,macro_auroc_ci_high=ci_hi,
+                brier=brier(yte,p,classes),ece=ece(yte,p,classes),
                 event_time_mae=tmae,warning_threshold=thr,warning_fpr=fp/max(nonharm,1),
                 median_warning_lead=float(np.median(leads)) if leads else float("nan"),
                 n_test_prefixes=len(te),n_test_runs=te.meta_run_id.nunique(),classes_test=",".join(sorted(set(yte)))))
