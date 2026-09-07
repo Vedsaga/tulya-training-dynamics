@@ -1,0 +1,42 @@
+{
+  "experiment": "experiment2_ruthless_cross_domain",
+  "preregistration_commit": "55d14120fe76ffeaa03c0d14ab4c90ec120c9486",
+  "domains": [
+    "modular_transformer",
+    "fashion_mnist_mlp",
+    "cifar10_cnn",
+    "synthetic_sequence_gru"
+  ],
+  "target_runs_per_domain": 20,
+  "observation_fractions": [
+    0.1,
+    0.2,
+    0.3,
+    0.4
+  ],
+  "main_metrics": [
+    "macro_ovr_auroc",
+    "multiclass_brier",
+    "ece",
+    "normalized_event_time_mae",
+    "warning_lead_fraction",
+    "telemetry_overhead_fraction"
+  ],
+  "gates": {
+    "mean_macro_auroc_min": 0.8,
+    "every_domain_macro_auroc_min": 0.75,
+    "candidate_minus_strong_baseline_mean_auroc_min": 0.05,
+    "candidate_worst_domain_delta_vs_baseline_min": -0.02,
+    "brier_relative_improvement_min_or": 0.1,
+    "event_time_mae_relative_improvement_min_or": 0.15,
+    "mean_ece_max": 0.1,
+    "normalized_event_time_mae_max": 0.15,
+    "warning_false_positive_rate_max": 0.05,
+    "median_warning_lead_fraction_min": 0.1,
+    "telemetry_overhead_fraction_max": 0.02
+  },
+  "core_kill_gates": [
+    "transfer_quality",
+    "incremental_value_over_strong_baseline"
+  ]
+}
