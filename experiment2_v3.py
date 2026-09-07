@@ -122,10 +122,17 @@ def validate_v3_manifest(manifest:pd.DataFrame):
     bad=sorted(set(manifest.event)-V3_ALLOWED)
     if bad:problems.append(f"unexpected outcome classes: {bad}")
 
-    cell=(manifest.groupby(["domain","recipe_name","recipe_expected_event"])
-          .apply(lambda g:int((g.event==g.recipe_expected_event.iloc[0]).sum()),
-                 include_groups=False)
-          .rename("matches").reset_index())
+    cell_rows=[]
+    for (domain,recipe_name,expected),g in manifest.groupby(
+        ["domain","recipe_name","recipe_expected_event"]
+    ):
+        cell_rows.append(dict(
+            domain=domain,recipe_name=recipe_name,
+            recipe_expected_event=expected,
+            matches=int((g.event==expected).sum()),
+            runs=len(g),
+        ))
+    cell=pd.DataFrame(cell_rows)
     for _,r in cell.iterrows():
         if int(r.matches)<4:
             problems.append(
