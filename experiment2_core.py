@@ -226,6 +226,15 @@ def train_modular(sp,outroot,telemetry=True):
 def run_one(sp,outroot,dataroot="/kaggle/working/tulya_data",telemetry=True):
     return train_modular(sp,outroot,telemetry) if sp.domain=="modular_transformer" else train_generic(sp,outroot,dataroot,telemetry)
 
+
+def benchmark_overhead(outroot,domain="synthetic_sequence_gru",seed=991):
+    sp=RunSpec(domain,"healthy",seed); root=Path(outroot)/"overhead_benchmark"
+    a=train_modular(sp,str(root/"with")) if domain=="modular_transformer" else train_generic(sp,str(root/"with"),"/kaggle/working/tulya_data",True)
+    b=train_modular(sp,str(root/"without"),False) if domain=="modular_transformer" else train_generic(sp,str(root/"without"),"/kaggle/working/tulya_data",False)
+    frac=(a["wall_time_sec"]-b["wall_time_sec"])/max(b["wall_time_sec"],1e-9)
+    ans=dict(domain=domain,with_sec=a["wall_time_sec"],without_sec=b["wall_time_sec"],overhead_fraction=frac,pass_le_0_02=frac<=.02)
+    root.mkdir(parents=True,exist_ok=True);(root/"summary.json").write_text(json.dumps(ans,indent=2));return ans
+
 def run_suite(outroot,seeds=(0,1,2,3),domains:Optional[Sequence[str]]=None,resume=True):
     ds=set(domains or DOMAINS); ss=[x for x in specs(seeds) if x.domain in ds]; root=Path(outroot);root.mkdir(parents=True,exist_ok=True); ans=[]
     for j,sp in enumerate(ss,1):
