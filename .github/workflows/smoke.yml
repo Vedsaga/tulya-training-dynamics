@@ -13,4 +13,4 @@ jobs:
         with:
           python-version: "3.11"
       - name: Compile experiment
-        run: python -m py_compile kaggle_grokking_experiment.py experiment2_core.py experiment2_eval.py
+        run: python -m py_compile kaggle_grokking_experiment.py experiment2_core.py experiment2_eval.py experiment2_v3.py
