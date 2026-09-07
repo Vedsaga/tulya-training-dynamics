@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import json, math, random, time
+import argparse, json, math, os, random, subprocess, sys, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
@@ -17,6 +18,7 @@ from kaggle_grokking_experiment import (
 DOMAINS=("modular_transformer","fashion_mnist_mlp","cifar10_cnn","synthetic_sequence_gru")
 INTENTS=("healthy","high_lr","low_lr","small_train","strong_regularization")
 HARMFUL={"divergence","stagnation","overfit_or_memorization"}
+NO_EVENT="no_event"
 
 @dataclass(frozen=True)
 class RunSpec:
@@ -132,24 +134,41 @@ def finish_features(df,domain):
     return df
 
 def label_event(df,domain):
-    d=df.sort_values("meta_step_fraction").copy(); d["tp"]=d.feature_train_acc.map(lambda x:progress(x,domain)); d["vp"]=d.label_val_acc.map(lambda x:progress(x,domain))
+    """Return (event_type, event_or_censor_time_fraction, event_observed).
+
+    Successful/healthy completion is right-censored rather than treated as an event.
+    """
+    d=df.sort_values("meta_step_fraction").copy()
+    d["tp"]=d.feature_train_acc.map(lambda x:progress(x,domain))
+    d["vp"]=d.label_val_acc.map(lambda x:progress(x,domain))
     ini=max(float(d.iloc[0].feature_train_loss),1e-6)
     for _,r in d.iterrows():
-        if not math.isfinite(r.feature_train_loss) or (r.meta_step_fraction>=.1 and r.feature_train_loss>max(10.,6*ini)): return "divergence",float(r.meta_step_fraction)
-    early=d[d.meta_step_fraction<=.4]; late=d[d.meta_step_fraction>=.5]
+        if not math.isfinite(r.feature_train_loss) or (
+            r.meta_step_fraction>=.1 and r.feature_train_loss>max(10.,6*ini)
+        ):
+            return "divergence",float(r.meta_step_fraction),True
+
+    early=d[d.meta_step_fraction<=.4]
+    late=d[d.meta_step_fraction>=.5]
     if len(early) and len(late) and (early.tp>=.9).any() and early.iloc[-1].vp<.45:
         q=late[late.vp>=.75]
-        if len(q): return "delayed_improvement",float(q.iloc[0].meta_step_fraction)
-    q=d[(d.meta_step_fraction<=.4)&(d.vp>=.65)]
-    if len(q) and d.iloc[-1].vp>=.6: return "healthy_convergence",float(q.iloc[0].meta_step_fraction)
+        if len(q):
+            return "delayed_improvement",float(q.iloc[0].meta_step_fraction),True
+
     q=d[(d.meta_step_fraction>=.4)&(d.tp>=.9)&(d.vp<.45)]
-    if len(q): return "overfit_or_memorization",float(q.iloc[0].meta_step_fraction)
+    if len(q):
+        return "overfit_or_memorization",float(q.iloc[0].meta_step_fraction),True
+
     q=d[d.meta_step_fraction>=.6]
-    if len(q) and q.iloc[0].tp<.55 and q.iloc[0].vp<.5: return "stagnation",float(q.iloc[0].meta_step_fraction)
+    if len(q) and q.iloc[0].tp<.55 and q.iloc[0].vp<.5:
+        return "stagnation",float(q.iloc[0].meta_step_fraction),True
+
     f=d.iloc[-1]
-    if f.vp>=.6:return "healthy_convergence",float(f.meta_step_fraction)
-    if f.tp>=.85 and f.vp<.5:return "overfit_or_memorization",float(f.meta_step_fraction)
-    return "stagnation",float(f.meta_step_fraction)
+    if f.vp>=.6:
+        return NO_EVENT,float(f.meta_step_fraction),False
+    if f.tp>=.85 and f.vp<.5:
+        return "overfit_or_memorization",float(f.meta_step_fraction),True
+    return "stagnation",float(f.meta_step_fraction),True
 
 def add_dynamics(row,m,cur,init,before,g,pg,pu,window,proj,probe_stats):
     w=l2(cur); row.update(feature_weight_l2=w,feature_weight_growth_from_init=w/max(l2(init),1e-12),
@@ -186,7 +205,8 @@ def train_generic(sp,outroot,dataroot,telemetry=True):
         ps=probe(m,pb) if telemetry else {}; pg,pu=add_dynamics(row,m,cur,init,before,g,pg,pu,window,proj,ps) if telemetry else (pg,pu); rows.append(row)
         if not math.isfinite(tl):break
     df=finish_features(pd.DataFrame(rows),sp.domain); od=Path(outroot)/sp.run_id; od.mkdir(parents=True,exist_ok=True); df.to_csv(od/"metrics.csv",index=False)
-    ev,et=label_event(df,sp.domain); sm=dict(run_id=sp.run_id,domain=sp.domain,intent=sp.intent,seed=sp.seed,event=ev,event_time_fraction=et,
+    ev,et,observed=label_event(df,sp.domain); sm=dict(run_id=sp.run_id,domain=sp.domain,intent=sp.intent,seed=sp.seed,event=ev,event_time_fraction=et,
+        event_observed=observed,censor_time_fraction=(None if observed else et),
         wall_time_sec=time.perf_counter()-start,max_steps=steps,lr=lr,weight_decay=wd,telemetry_enabled=telemetry)
     (od/"summary.json").write_text(json.dumps(sm,indent=2)); return sm
 
@@ -219,7 +239,8 @@ def train_modular(sp,outroot,telemetry=True):
         ps=probe_mod(m,pb) if telemetry else {};pg,pu=add_dynamics(row,m,cur,init,before,g,pg,pu,window,proj,ps) if telemetry else (pg,pu);rows.append(row)
         if not math.isfinite(tl):break
     df=finish_features(pd.DataFrame(rows),sp.domain);od=Path(outroot)/sp.run_id;od.mkdir(parents=True,exist_ok=True);df.to_csv(od/"metrics.csv",index=False)
-    ev,et=label_event(df,sp.domain);sm=dict(run_id=sp.run_id,domain=sp.domain,intent=sp.intent,seed=sp.seed,event=ev,event_time_fraction=et,
+    ev,et,observed=label_event(df,sp.domain);sm=dict(run_id=sp.run_id,domain=sp.domain,intent=sp.intent,seed=sp.seed,event=ev,event_time_fraction=et,
+        event_observed=observed,censor_time_fraction=(None if observed else et),
         wall_time_sec=time.perf_counter()-start,max_steps=steps,lr=lr,weight_decay=wd,train_fraction=frac,telemetry_enabled=telemetry)
     (od/"summary.json").write_text(json.dumps(sm,indent=2));return sm
 
@@ -243,3 +264,114 @@ def run_suite(outroot,seeds=(0,1,2,3),domains:Optional[Sequence[str]]=None,resum
         else: print(f"[{j}/{len(ss)}] run {sp.run_id}"); sm=run_one(sp,outroot); print(f" -> {sm['event']} @ {sm['event_time_fraction']:.3f}, {sm['wall_time_sec']:.1f}s")
         ans.append(sm)
     df=pd.DataFrame(ans);df.to_csv(root/"manifest.csv",index=False);return df
+
+
+
+def prepare_datasets(dataroot="/kaggle/working/tulya_data"):
+    """Download image datasets once before parallel workers start."""
+    root=Path(dataroot); root.mkdir(parents=True,exist_ok=True)
+    datasets.FashionMNIST(root,train=True,download=True)
+    datasets.FashionMNIST(root,train=False,download=True)
+    datasets.CIFAR10(root,train=True,download=True)
+    datasets.CIFAR10(root,train=False,download=True)
+
+
+def _subprocess_worker(gpu_id, work, outroot, dataroot):
+    completed=[]
+    env=os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"]=str(gpu_id)
+    env["PYTHONUNBUFFERED"]="1"
+    script=str(Path(__file__).resolve())
+    for sp in work:
+        p=Path(outroot)/sp.run_id/"summary.json"
+        if p.exists():
+            sm=json.loads(p.read_text())
+            print(f"[GPU {gpu_id}] reuse {sp.run_id}: {sm['event']}",flush=True)
+            completed.append(sm)
+            continue
+        print(f"[GPU {gpu_id}] start {sp.run_id}",flush=True)
+        cmd=[sys.executable,script,"--worker",
+             "--domain",sp.domain,"--intent",sp.intent,"--seed",str(sp.seed),
+             "--outroot",str(outroot),"--dataroot",str(dataroot)]
+        cp=subprocess.run(cmd,env=env,text=True,capture_output=True)
+        if cp.returncode!=0:
+            raise RuntimeError(
+                f"worker failed on GPU {gpu_id}: {sp.run_id}\nSTDOUT:\n{cp.stdout}\nSTDERR:\n{cp.stderr}"
+            )
+        sm=json.loads(p.read_text())
+        print(
+            f"[GPU {gpu_id}] done {sp.run_id}: {sm['event']} "
+            f"observed={sm['event_observed']} @ {sm['event_time_fraction']:.3f}, "
+            f"{sm['wall_time_sec']:.1f}s",
+            flush=True,
+        )
+        completed.append(sm)
+    return completed
+
+
+def run_suite_parallel(outroot,seeds=(0,1,2,3),domains:Optional[Sequence[str]]=None,
+                       resume=True,gpu_ids:Optional[Sequence[int]]=None,
+                       dataroot="/kaggle/working/tulya_data"):
+    """Run independent experiments concurrently, one subprocess per GPU.
+
+    Each child process receives exactly one visible GPU, so torch inside that
+    process safely uses cuda:0 without global device/seed interference.
+    """
+    ds=set(domains or DOMAINS)
+    ss=[x for x in specs(seeds) if x.domain in ds]
+    root=Path(outroot); root.mkdir(parents=True,exist_ok=True)
+    if not resume:
+        existing=[root/x.run_id for x in ss if (root/x.run_id).exists()]
+        if existing:
+            raise RuntimeError("resume=False but run directories already exist; use a fresh v2 output directory")
+
+    ids=list(gpu_ids if gpu_ids is not None else range(torch.cuda.device_count()))
+    if not ids:
+        print("No CUDA GPUs visible; falling back to serial run_suite.",flush=True)
+        return run_suite(outroot,seeds=seeds,domains=domains,resume=resume)
+
+    # Avoid concurrent torchvision download/extraction races.
+    if any(x.domain in {"fashion_mnist_mlp","cifar10_cnn"} for x in ss):
+        prepare_datasets(dataroot)
+
+    # Round-robin gives both GPUs a comparable mix of domains/configurations.
+    queues=[[] for _ in ids]
+    for i,sp in enumerate(ss):
+        queues[i % len(ids)].append(sp)
+
+    print(f"Launching {len(ss)} runs across {len(ids)} GPU workers: {ids}",flush=True)
+    with ThreadPoolExecutor(max_workers=len(ids)) as ex:
+        futs=[ex.submit(_subprocess_worker,g,work,outroot,dataroot)
+              for g,work in zip(ids,queues) if work]
+        for fut in as_completed(futs):
+            fut.result()
+
+    ans=[]
+    for sp in ss:
+        p=root/sp.run_id/"summary.json"
+        if not p.exists():
+            raise RuntimeError(f"missing completed summary: {p}")
+        ans.append(json.loads(p.read_text()))
+    df=pd.DataFrame(ans)
+    df.to_csv(root/"manifest.csv",index=False)
+    return df
+
+
+def _main():
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--worker",action="store_true")
+    ap.add_argument("--domain",choices=DOMAINS)
+    ap.add_argument("--intent",choices=INTENTS)
+    ap.add_argument("--seed",type=int)
+    ap.add_argument("--outroot")
+    ap.add_argument("--dataroot",default="/kaggle/working/tulya_data")
+    args=ap.parse_args()
+    if args.worker:
+        if args.domain is None or args.intent is None or args.seed is None or args.outroot is None:
+            ap.error("--worker requires --domain --intent --seed --outroot")
+        sm=run_one(RunSpec(args.domain,args.intent,args.seed),args.outroot,args.dataroot,True)
+        print(json.dumps(sm),flush=True)
+
+
+if __name__=="__main__":
+    _main()
